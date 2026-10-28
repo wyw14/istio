@@ -126,6 +126,10 @@ type DiscoveryServer struct {
 	// pushQueue is the buffer that used after debounce and before the real xds push.
 	pushQueue *PushQueue
 
+	// pushStatus records per-connection push triggers (source/version and pending/succeeded/failed
+	// state). It is a no-op unless PILOT_ENABLE_PUSH_STATUS_RECORDS is enabled.
+	pushStatus *PushStatusRecorder
+
 	// debugHandlers is the list of all the supported debug handlers.
 	debugHandlers map[string]string
 
@@ -170,6 +174,7 @@ type DiscoveryServer struct {
 
 // NewDiscoveryServer creates DiscoveryServer that sources data from Pilot's internal mesh data structures
 func NewDiscoveryServer(env *model.Environment, clusterAliases map[string]string, debugger *krt.DebugHandler) *DiscoveryServer {
+	pushStatus := NewPushStatusRecorder(features.EnablePushStatusRecords)
 	out := &DiscoveryServer{
 		Env:                 env,
 		Generators:          map[string]model.XdsResourceGenerator{},
@@ -179,7 +184,8 @@ func NewDiscoveryServer(env *model.Environment, clusterAliases map[string]string
 		InboundUpdates:      atomic.NewInt64(0),
 		CommittedUpdates:    atomic.NewInt64(0),
 		pushChannel:         make(chan *model.PushRequest, 10),
-		pushQueue:           NewPushQueue(),
+		pushQueue:           NewPushQueue(WithPushStatusRecorder(pushStatus)),
+		pushStatus:          pushStatus,
 		debugHandlers:       map[string]string{},
 		adsClients:          map[string]*Connection{},
 		krtDebugger:         debugger,
@@ -556,9 +562,15 @@ func doSendPushes(stopCh <-chan struct{}, semaphore chan struct{}, queue *PushQu
 				case client.PushCh() <- pushEv:
 					return
 				case <-closed: // grpc stream was closed
+					// The trigger never reached config generation; record it as an entry-stage
+					// failure before MarkDone re-enqueues triggers merged in during dispatch.
+					queue.CompletePush(client, PushStageEntry,
+						fmt.Errorf("push discarded: connection %s closed before the push was delivered", client.ID()))
 					doneFunc()
 					log.Infof("Client closed connection %v", client.ID())
 				case <-stopCh: // unblock goroutines already in-flight so outer loop can unblock and select on stopCh to exit
+					queue.CompletePush(client, PushStageEntry,
+						fmt.Errorf("push discarded: push to client %s was aborted during server shutdown", client.ID()))
 					doneFunc()
 					log.Infof("Push to client %v aborted due to server shutdown", client.ID())
 				}

@@ -138,6 +138,9 @@ func (s *DiscoveryServer) StreamDeltas(stream DeltaDiscoveryStream) error {
 		case ev := <-con.PushCh():
 			pushEv := ev.(*Event)
 			err := s.pushConnectionDelta(con, pushEv)
+			// Mirror Connection.Push: finalize the queued trigger records for this batch. No-op
+			// when recording is disabled and never alters the returned error.
+			s.pushStatus.Complete(con, PushStageGenerate, err)
 			pushEv.done()
 			if err != nil {
 				return err

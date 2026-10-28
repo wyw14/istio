@@ -35,15 +35,36 @@ type PushQueue struct {
 	// If model.PushRequest is not nil, it will be Enqueued again once MarkDone has been called.
 	processing map[*Connection]*model.PushRequest
 
+	// status, when enabled, records one entry per trigger (per Enqueue call), including triggers
+	// merged into a pending or in-flight push. It is never required for queue correctness; a nil
+	// or disabled recorder leaves all behavior unchanged.
+	status *PushStatusRecorder
+
 	shuttingDown bool
 }
 
-func NewPushQueue() *PushQueue {
-	return &PushQueue{
+// PushQueueOption configures a PushQueue. Options are additive and optional so that existing
+// callers of NewPushQueue continue to work without any arguments.
+type PushQueueOption func(*PushQueue)
+
+// WithPushStatusRecorder attaches a push status recorder. A nil or disabled recorder is equivalent
+// to not passing the option: no records are produced.
+func WithPushStatusRecorder(recorder *PushStatusRecorder) PushQueueOption {
+	return func(p *PushQueue) {
+		p.status = recorder
+	}
+}
+
+func NewPushQueue(opts ...PushQueueOption) *PushQueue {
+	p := &PushQueue{
 		pending:    make(map[*Connection]*model.PushRequest),
 		processing: make(map[*Connection]*model.PushRequest),
 		cond:       sync.NewCond(&sync.Mutex{}),
 	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
 }
 
 // Enqueue will mark a proxy as pending a push. If it is already pending, pushInfo will be merged.
@@ -53,8 +74,14 @@ func (p *PushQueue) Enqueue(con *Connection, pushRequest *model.PushRequest) {
 	defer p.cond.L.Unlock()
 
 	if p.shuttingDown {
+		// Recording happens after the decision to reject so the default (recorder disabled) path
+		// returns exactly as before.
+		p.status.RecordEntryRejected(con, pushRequest, errPushQueueShuttingDown)
 		return
 	}
+
+	// Every trigger keeps its own source/version record even when the queue merges it.
+	p.status.RecordEnqueue(con, pushRequest)
 
 	// If its already in progress, merge the info and return
 	if request, f := p.processing[con]; f {
@@ -100,7 +127,18 @@ func (p *PushQueue) Dequeue() (con *Connection, request *model.PushRequest, shut
 	// Mark the connection as in progress
 	p.processing[con] = nil
 
+	// Snapshot the triggers this processing round covers, before new triggers can merge in.
+	p.status.Start(con)
+
 	return con, request, false
+}
+
+// CompletePush records the outcome of the in-flight processing round for the connection. A nil
+// error marks the batch succeeded; a non-nil error marks it failed with the stage at which it
+// failed. Triggers merged into the connection while processing are not part of the batch and keep
+// their pending state. It is a no-op without an enabled recorder.
+func (p *PushQueue) CompletePush(con *Connection, stage PushStage, err error) {
+	p.status.Complete(con, stage, err)
 }
 
 func (p *PushQueue) MarkDone(con *Connection) {

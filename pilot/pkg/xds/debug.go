@@ -210,6 +210,10 @@ func (s *DiscoveryServer) AddDebugHandlers(mux, internalMux *http.ServeMux, enab
 	s.addDebugHandler(mux, internalMux, "/debug/adsz?brief", "Status and debug interface for ADS, omitting watched resource names", s.adsz)
 
 	s.addDebugHandler(mux, internalMux, "/debug/syncz", "Synchronization status of all Envoys connected to this Pilot instance", s.Syncz)
+	s.addDebugHandler(mux, internalMux, "/debug/push_records",
+		"Per-connection config push trigger records (source, version and pending/succeeded/failed state); "+
+			"requires PILOT_ENABLE_PUSH_STATUS_RECORDS. Optional proxyID query parameter selects one connection",
+		s.PushRecords)
 
 	s.addDebugHandler(mux, internalMux, "/debug/registryz", "Debug support for registry", s.registryz)
 	s.addDebugHandler(mux, internalMux, "/debug/endpointz", "Obsolete, use endpointShardz", s.endpointShardz)
@@ -385,6 +389,26 @@ func (s *DiscoveryServer) Syncz(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 	writeJSON(w, syncz, req)
+}
+
+// PushRecords dumps the per-connection config push trigger records: every trigger keeps its source
+// (trigger reason) and version, and pending, succeeded and failed records are listed separately.
+// An optional proxyID query parameter returns a single connection; otherwise all connections are
+// returned. When PILOT_ENABLE_PUSH_STATUS_RECORDS is disabled the response reports enabled=false
+// with no records.
+func (s *DiscoveryServer) PushRecords(w http.ResponseWriter, req *http.Request) {
+	summary := PushStatusSummary{
+		Enabled:     s.pushStatus.Enabled(),
+		Connections: s.pushStatus.Status(),
+	}
+	if proxyID := req.URL.Query().Get("proxyID"); proxyID != "" {
+		// Reset to the single, exact connection to avoid partial matches.
+		summary.Connections = nil
+		if status := s.pushStatus.ConnectionStatus(proxyID); status != nil {
+			summary.Connections = []PushConnectionStatus{*status}
+		}
+	}
+	writeJSON(w, summary, req)
 }
 
 // registryz providees debug support for registry - adding and listing model items.

@@ -103,6 +103,16 @@ var (
 			" WDS pushes may be delayed, but there will be fewer pushes. By default this is enabled",
 	).Get()
 
+	EnablePushStatusRecords = env.Register(
+		"PILOT_ENABLE_PUSH_STATUS_RECORDS",
+		false,
+		"If enabled, Pilot keeps, per XDS connection, a bounded record of each config push trigger (including triggers "+
+			"merged while a push is in flight), tagged with its trigger source and version. Succeeded, failed and pending "+
+			"records can be queried separately at /debug/push_records; failures record whether they happened at the dispatch "+
+			"entry or during config generation. When disabled (the default) no records are kept, and push distribution "+
+			"results, return values and errors are unchanged.",
+	).Get()
+
 	ConvertSidecarScopeConcurrency = env.Register(
 		"PILOT_CONVERT_SIDECAR_SCOPE_CONCURRENCY",
 		1,

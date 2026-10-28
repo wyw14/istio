@@ -600,6 +600,19 @@ func (pr *PushRequest) IsRequest() bool {
 	return len(pr.Reason) == 1 && pr.Reason.Has(ProxyRequest)
 }
 
+// TriggerSources returns an independent snapshot of the sources (trigger reasons) that caused this
+// push request. It never returns nil and can be retained by status records even if the originating
+// request is later merged or mutated. Multiple entries represent distinct triggers that were merged
+// into one request, not multiple classifications of the same trigger.
+func (pr *PushRequest) TriggerSources() ReasonStats {
+	if pr == nil || len(pr.Reason) == 0 {
+		return ReasonStats{}
+	}
+	sources := make(ReasonStats, len(pr.Reason))
+	sources.Merge(pr.Reason)
+	return sources
+}
+
 func (pr *PushRequest) IsProxyUpdate() bool {
 	return pr.Reason.Has(ProxyUpdate)
 }

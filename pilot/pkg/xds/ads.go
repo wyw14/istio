@@ -130,6 +130,9 @@ func (conn *Connection) Process(req *discovery.DiscoveryRequest) error {
 func (conn *Connection) Push(ev any) error {
 	pushEv := ev.(*Event)
 	err := conn.s.pushConnection(conn, pushEv)
+	// Record the outcome of the queued triggers that produced this push. This is a no-op when
+	// recording is disabled and never alters the error returned to the stream event loop.
+	conn.s.pushStatus.Complete(conn, PushStageGenerate, err)
 	pushEv.done()
 	return err
 }
@@ -613,6 +616,8 @@ func (s *DiscoveryServer) removeCon(conID string) {
 	} else {
 		delete(s.adsClients, conID)
 		recordXDSClients(con.proxy.Metadata.IstioVersion, -1)
+		// Drop per-connection push trigger records; no-op when recording is disabled.
+		s.pushStatus.DeleteConnection(con)
 	}
 }
 
