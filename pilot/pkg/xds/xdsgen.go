@@ -150,6 +150,12 @@ func (s *DiscoveryServer) pushXds(con *Connection, w *model.WatchedResource, req
 	}
 	defer func() { recordPushTime(w.TypeUrl, time.Since(t0)) }()
 
+	// Observe the sources of the generated resources in the read-only index. This does not
+	// affect the response or trigger any further push.
+	if rtype, tracked := resourceSourceIndexTypeURL[w.TypeUrl]; tracked {
+		s.recordResourceSources(con.proxy, req.Push, rtype, res)
+	}
+
 	resp := &discovery.DiscoveryResponse{
 		ControlPlane: ControlPlane(w.TypeUrl),
 		TypeUrl:      w.TypeUrl,

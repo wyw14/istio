@@ -534,6 +534,15 @@ func (s *DiscoveryServer) pushDeltaXds(con *Connection, w *model.WatchedResource
 		}
 		resp.RemovedResources = sets.SortedList(removed)
 	}
+
+	// Observe resource sources in the read-only index without triggering further pushes.
+	if rtype, tracked := resourceSourceIndexTypeURL[w.TypeUrl]; tracked {
+		if usedDelta {
+			s.recordResourceSourcesDelta(con.proxy, req.Push, rtype, res, deletedRes)
+		} else {
+			s.recordResourceSources(con.proxy, req.Push, rtype, res)
+		}
+	}
 	var newResourceNames sets.String
 	if shouldSetWatchedResources(w) {
 		// Set the new watched resources. Do not write to w directly, as it can be a copy from the 'filtered' logic above

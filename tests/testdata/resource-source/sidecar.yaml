@@ -1,0 +1,12 @@
+apiVersion: networking.istio.io/v1alpha3
+kind: Sidecar
+metadata:
+  name: restricted-sidecar
+  namespace: restricted
+spec:
+  workloadSelector:
+    labels:
+      app: restricted-app
+  egress:
+    - hosts:
+        - "default/reviews.default.svc.cluster.local"

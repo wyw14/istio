@@ -1371,6 +1371,7 @@ func ProxyConfig(ctx cli.Context) *cobra.Command {
 	configCmd.AddCommand(listenerConfigCmd(ctx))
 	configCmd.AddCommand(logCmd(ctx))
 	configCmd.AddCommand(routeConfigCmd(ctx))
+	configCmd.AddCommand(SourcesCommand(ctx))
 	configCmd.AddCommand(bootstrapConfigCmd(ctx))
 	configCmd.AddCommand(endpointConfigCmd(ctx))
 	configCmd.AddCommand(edsConfigCmd(ctx))

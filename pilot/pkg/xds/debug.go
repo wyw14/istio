@@ -220,6 +220,7 @@ func (s *DiscoveryServer) AddDebugHandlers(mux, internalMux *http.ServeMux, enab
 	s.addDebugHandler(mux, internalMux, "/debug/configz", "Debug support for config", s.configz)
 	s.addDebugHandler(mux, internalMux, "/debug/sidecarz", "Debug sidecar scope for a proxy", s.sidecarz)
 	s.addDebugHandler(mux, internalMux, "/debug/resourcesz", "Debug support for watched resources", s.resourcez)
+	s.addDebugHandler(mux, internalMux, "/debug/resource_sources", "Read-only index of Service/VirtualService/Gateway/default sources and versions for generated listeners, clusters and routes", s.resourceSourcesz)
 	s.addDebugHandler(mux, internalMux, "/debug/instancesz", "Debug support for service instances", s.instancesz)
 	s.addDebugHandler(mux, internalMux, "/debug/ambientz", "Debug support for ambient", s.ambientz)
 	s.addDebugHandler(mux, internalMux, "/debug/krtz", "Debug support for krt (internal state)", s.krtz)

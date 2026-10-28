@@ -607,12 +607,30 @@ func (s *DiscoveryServer) removeCon(conID string) {
 	s.adsClientsMutex.Lock()
 	defer s.adsClientsMutex.Unlock()
 
+	proxyID := ""
 	if con, exist := s.adsClients[conID]; !exist {
 		log.Errorf("ADS: Removing connection for non-existing node:%v.", conID)
 		xds.TotalXDSInternalErrors.Increment()
 	} else {
+		proxyID = con.proxy.ID
 		delete(s.adsClients, conID)
 		recordXDSClients(con.proxy.Metadata.IstioVersion, -1)
+	}
+
+	// Drop the read-only source index entry only once the proxy has no remaining streams. A
+	// proxy may carry more than one concurrent stream (e.g. SOTW plus delta), so a single
+	// stream closing must not discard sources another stream still serves.
+	if proxyID != "" {
+		stillConnected := false
+		for _, other := range s.adsClients {
+			if other.proxy.ID == proxyID {
+				stillConnected = true
+				break
+			}
+		}
+		if !stillConnected {
+			s.SourceIndex.RemoveProxy(proxyID)
+		}
 	}
 }
 

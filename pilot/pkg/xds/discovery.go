@@ -146,6 +146,12 @@ type DiscoveryServer struct {
 	// Cache for XDS resources
 	Cache model.XdsCache
 
+	// SourceIndex records, per connected proxy, the configuration sources (Service,
+	// VirtualService, Gateway or synthesized defaults) of generated listener/cluster/route
+	// resources. It is populated as a read-only side effect of generation and never triggers
+	// a push. Exposed read-only through the /debug/resource_sources endpoint.
+	SourceIndex *model.ResourceSourceIndex
+
 	// JwtKeyResolver holds a reference to the JWT key resolver instance.
 	JwtKeyResolver *model.JwksResolver
 
@@ -190,6 +196,7 @@ func NewDiscoveryServer(env *model.Environment, clusterAliases map[string]string
 			enableWDSDebounce: features.EnableWDSDebounce,
 		},
 		Cache:              env.Cache,
+		SourceIndex:        model.NewResourceSourceIndex(),
 		DiscoveryStartTime: processStartTime,
 	}
 
