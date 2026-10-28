@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"istio.io/istio/istioctl/pkg/analyze"
+	"istio.io/istio/istioctl/pkg/analyze/baseline"
 	"istio.io/istio/istioctl/pkg/util"
 )
 
@@ -50,6 +51,8 @@ func GetExitCode(e error) int {
 	case util.CommandParseError:
 		return ExitIncorrectUsage
 	case analyze.FileParseError:
+		return ExitDataError
+	case *baseline.FileError:
 		return ExitDataError
 	case analyze.AnalyzerFoundIssuesError:
 		return ExitAnalyzerFoundIssues

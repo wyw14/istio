@@ -16,7 +16,9 @@ package analyze
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -29,7 +31,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/clientcmd"
+	"sigs.k8s.io/yaml"
 
+	"istio.io/istio/istioctl/pkg/analyze/baseline"
 	"istio.io/istio/istioctl/pkg/cli"
 	"istio.io/istio/istioctl/pkg/util"
 	"istio.io/istio/istioctl/pkg/util/formatting"
@@ -82,6 +86,8 @@ var (
 	revisionSpecified string
 	remoteContexts    []string
 	selectedAnalyzers []string
+	baselineFile      string
+	baselineExport    string
 
 	fileExtensions = []string{".json", ".yaml", ".yml"}
 )
@@ -117,7 +123,13 @@ func Analyze(ctx cli.Context) *cobra.Command {
   istioctl analyze -L
   
   # Run specific analyzer
-  istioctl analyze --analyzer "gateway.ConflictingGatewayAnalyzer"`,
+  istioctl analyze --analyzer "gateway.ConflictingGatewayAnalyzer"
+
+  # Export the current diagnostics as a baseline for a cluster being remediated
+  istioctl analyze --baseline-export analysis-baseline.yaml
+
+  # Analyze against a baseline: only new or changed diagnostics fail the command
+  istioctl analyze --baseline analysis-baseline.yaml`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			msgOutputFormat = strings.ToLower(msgOutputFormat)
 			_, ok := formatting.MsgOutputFormats[msgOutputFormat]
@@ -135,6 +147,23 @@ func Analyze(ctx cli.Context) *cobra.Command {
 			if recursive {
 				fmt.Println("The recursive flag has been removed and is hardcoded to true without explicitly specifying it.")
 				return nil
+			}
+
+			if baselineFile != "" && baselineExport != "" {
+				return util.CommandParseError{
+					Err: fmt.Errorf("--baseline and --baseline-export cannot be used at the same time"),
+				}
+			}
+
+			// Load the baseline before running any analysis: a malformed baseline
+			// must fail loudly instead of silently behaving like an empty baseline.
+			var baselineDoc *baseline.Baseline
+			if baselineFile != "" {
+				var loadErr error
+				baselineDoc, loadErr = baseline.Load(baselineFile)
+				if loadErr != nil {
+					return loadErr
+				}
 			}
 
 			readers, err := gatherFiles(cmd, args)
@@ -275,60 +304,107 @@ func Analyze(ctx cli.Context) *cobra.Command {
 				fmt.Fprintln(cmd.ErrOrStderr())
 			}
 
-			// Get messages for output
-			outputMessages := result.Messages.SetDocRef("istioctl-analyze").FilterOutLowerThan(outputThreshold.Level)
+			// Explicitly export the current diagnostics as a baseline and stop:
+			// new diagnostics are never added to a baseline automatically.
+			if baselineExport != "" {
+				return exportBaseline(cmd, result.Messages, parseErrors)
+			}
+
+			// Classify diagnostics against the baseline, if one was provided.
+			var baselineReport *baseline.Report
+			if baselineDoc != nil {
+				r := baseline.Classify(baselineDoc, result.Messages, time.Now().UTC())
+				baselineReport = &r
+			}
+
+			result.Messages.SetDocRef("istioctl-analyze")
+
+			// activeMessages are the diagnostics that are not accepted by the
+			// baseline; only they drive regular output and the exit code.
+			activeMessages := result.Messages
+			var knownMessages diag.Messages
+			if baselineReport != nil {
+				activeMessages = baselineReport.New
+				knownMessages = baselineReport.Known
+			}
 
 			if shouldPrintCluster {
-				for i := range outputMessages {
-					m := &outputMessages[i]
-					if m.Resource != nil && m.Resource.Origin.ClusterName().String() != "" {
-						m.PrintCluster = true
-					}
+				setPrintCluster(activeMessages)
+				setPrintCluster(knownMessages)
+			}
+
+			// Get messages for output
+			outputMessages := activeMessages.FilterOutLowerThan(outputThreshold.Level)
+			knownOutputMessages := knownMessages.FilterOutLowerThan(outputThreshold.Level)
+
+			if baselineReport == nil {
+				// Print all the messages to stdout in the specified format
+				output, err := formatting.Print(outputMessages, msgOutputFormat, colorize)
+				if err != nil {
+					return err
+				}
+				fmt.Fprintln(cmd.OutOrStdout(), output)
+			} else {
+				if err := printBaselineResult(cmd, baselineReport, outputMessages, knownOutputMessages); err != nil {
+					return err
 				}
 			}
 
-			// Print all the messages to stdout in the specified format
-			output, err := formatting.Print(outputMessages, msgOutputFormat, colorize)
-			if err != nil {
-				return err
-			}
-			fmt.Fprintln(cmd.OutOrStdout(), output)
-
 			// An extra message on success
-			if len(outputMessages) == 0 {
-				if parseErrors == 0 {
-					if len(readers) > 0 {
-						var files []string
-						for _, r := range readers {
-							files = append(files, r.Name)
-						}
-						if len(files) > 1 {
-							fmt.Fprintf(cmd.ErrOrStderr(), "\u2714 No validation issues found when analyzing:\n  - %s\n", strings.Join(files, "\n  - "))
+			if baselineReport == nil {
+				if len(outputMessages) == 0 {
+					if parseErrors == 0 {
+						if len(readers) > 0 {
+							var files []string
+							for _, r := range readers {
+								files = append(files, r.Name)
+							}
+							if len(files) > 1 {
+								fmt.Fprintf(cmd.ErrOrStderr(), "\u2714 No validation issues found when analyzing:\n  - %s\n", strings.Join(files, "\n  - "))
+							} else {
+								fmt.Fprintf(cmd.ErrOrStderr(), "\u2714 No validation issues found when analyzing %s.\n", strings.Join(files, "\n"))
+							}
 						} else {
-							fmt.Fprintf(cmd.ErrOrStderr(), "\u2714 No validation issues found when analyzing %s.\n", strings.Join(files, "\n"))
+							fmt.Fprintf(cmd.ErrOrStderr(), "\u2714 No validation issues found when analyzing %s.\n", analyzeTargetAsString())
 						}
 					} else {
-						fmt.Fprintf(cmd.ErrOrStderr(), "\u2714 No validation issues found when analyzing %s.\n", analyzeTargetAsString())
+						fileOrFiles := "files"
+						if parseErrors == 1 {
+							fileOrFiles = "file"
+						}
+						fmt.Fprintf(cmd.ErrOrStderr(),
+							"No validation issues found when analyzing %s (but %d %s could not be parsed).\n",
+							analyzeTargetAsString(),
+							parseErrors,
+							fileOrFiles,
+						)
 					}
-				} else {
-					fileOrFiles := "files"
-					if parseErrors == 1 {
-						fileOrFiles = "file"
+				}
+			} else {
+				writeBaselineSummary(cmd.ErrOrStderr(), baselineReport)
+				if len(activeMessages) == 0 {
+					if parseErrors == 0 {
+						fmt.Fprintf(cmd.ErrOrStderr(),
+							"\u2714 No new validation issues found when analyzing %s (%d known diagnostic(s) accepted by the baseline).\n",
+							analyzeTargetAsString(), len(baselineReport.Known))
+					} else {
+						fileOrFiles := "files"
+						if parseErrors == 1 {
+							fileOrFiles = "file"
+						}
+						fmt.Fprintf(cmd.ErrOrStderr(),
+							"No new validation issues found when analyzing %s, but %d %s could not be parsed.\n",
+							analyzeTargetAsString(), parseErrors, fileOrFiles)
 					}
-					fmt.Fprintf(cmd.ErrOrStderr(),
-						"No validation issues found when analyzing %s (but %d %s could not be parsed).\n",
-						analyzeTargetAsString(),
-						parseErrors,
-						fileOrFiles,
-					)
 				}
 			}
 
 			// Return code is based on the unfiltered validation message list/parse errors
-			// We're intentionally keeping failure threshold and output threshold decoupled for now
+			// We're intentionally keeping failure threshold and output threshold decoupled for now.
+			// When a baseline is in use, only diagnostics it does not accept can fail the command.
 			var returnError error
 			if msgOutputFormat == formatting.LogFormat {
-				returnError = errorIfMessagesExceedThreshold(result.Messages)
+				returnError = errorIfMessagesExceedThreshold(activeMessages)
 				if returnError == nil && parseErrors > 0 && !ignoreUnknown {
 					returnError = FileParseError{}
 				}
@@ -373,6 +449,15 @@ func Analyze(ctx cli.Context) *cobra.Command {
 	analysisCmd.PersistentFlags().StringArrayVarP(&selectedAnalyzers, "analyzer", "", []string{},
 		"Select specific analyzers to run. Can be repeated. If not specified, all analyzers are run. "+
 			"(e.g. istioctl analyze --analyzer \"gateway.ConflictingGatewayAnalyzer\")")
+	analysisCmd.PersistentFlags().StringVar(&baselineFile, "baseline", "",
+		"Use a diagnostic baseline file created with --baseline-export. Diagnostics identical to an unexpired "+
+			"baseline entry (same message code, severity, resource, cluster and message parameters; line numbers "+
+			"and ordering are ignored) are marked as known and do not trigger the failure threshold. New, "+
+			"disappeared and expired entries are summarized. A missing or malformed baseline file fails the command.")
+	analysisCmd.PersistentFlags().StringVar(&baselineExport, "baseline-export", "",
+		"Export the current diagnostics to a baseline file and exit. The file can later be passed to --baseline "+
+			"so that only diagnostics that are new or changed fail the command. Diagnostics without a reliable "+
+			"resource identity are not exported, and new diagnostics are never added to a baseline automatically.")
 	return analysisCmd
 }
 
@@ -477,6 +562,155 @@ func errorIfMessagesExceedThreshold(messages []diag.Message) error {
 	}
 
 	return nil
+}
+
+func setPrintCluster(messages diag.Messages) {
+	for i := range messages {
+		m := &messages[i]
+		if m.Resource != nil && m.Resource.Origin.ClusterName().String() != "" {
+			m.PrintCluster = true
+		}
+	}
+}
+
+// exportBaseline writes the current diagnostics to the requested baseline file
+// and exits. It never augments an existing baseline with new findings: the
+// export is always derived solely from the diagnostics just produced.
+func exportBaseline(cmd *cobra.Command, messages diag.Messages, parseErrors int) error {
+	doc, skipped := baseline.FromMessages(messages, time.Now().UTC())
+	if err := baseline.WriteFile(baselineExport, doc); err != nil {
+		return err
+	}
+	fmt.Fprintf(cmd.ErrOrStderr(), "Exported %d diagnostic(s) to baseline file %q.\n", len(doc.Entries), baselineExport)
+	if skipped > 0 {
+		fmt.Fprintf(cmd.ErrOrStderr(),
+			"Warning: %d diagnostic(s) without a reliable resource identity were not exported and will still fail future analyses.\n",
+			skipped)
+	}
+	if parseErrors > 0 && !ignoreUnknown {
+		return FileParseError{}
+	}
+	return nil
+}
+
+// printBaselineResult renders new and known diagnostics plus the baseline
+// summary in the requested output format.
+func printBaselineResult(cmd *cobra.Command, report *baseline.Report, newMessages, knownMessages diag.Messages) error {
+	switch msgOutputFormat {
+	case formatting.LogFormat:
+		if len(newMessages) > 0 {
+			output, err := formatting.Print(newMessages, formatting.LogFormat, colorize)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), output)
+		}
+		if len(knownMessages) > 0 {
+			output, err := formatting.Print(knownMessages, formatting.LogFormat, colorize)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(),
+				"Known diagnostics (accepted by the baseline, not counted towards the failure threshold):")
+			for _, line := range strings.Split(strings.TrimRight(output, "\n"), "\n") {
+				fmt.Fprintf(cmd.OutOrStdout(), "  %s\n", line)
+			}
+		}
+	case formatting.JSONFormat, formatting.YAMLFormat:
+		output, err := marshalBaselineMachineOutput(report, newMessages, knownMessages, msgOutputFormat)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(cmd.OutOrStdout(), output)
+	default:
+		return fmt.Errorf("%s not a valid option for format. See istioctl analyze --help", msgOutputFormat)
+	}
+	return nil
+}
+
+func writeBaselineSummary(w io.Writer, r *baseline.Report) {
+	fmt.Fprintf(w, "Baseline summary: %d new, %d known, %d disappeared, %d expired.\n",
+		len(r.New), len(r.Known), len(r.Disappeared), len(r.Expired))
+	if len(r.Disappeared) > 0 {
+		fmt.Fprintln(w, "Disappeared baseline entries (no longer reported):")
+		for _, e := range r.Disappeared {
+			fmt.Fprintf(w, "  - %s\n", e.String())
+		}
+	}
+	if len(r.Expired) > 0 {
+		fmt.Fprintln(w, "Expired baseline entries (diagnostics are reported normally again):")
+		for _, e := range r.Expired {
+			fmt.Fprintf(w, "  - %s\n", e.String())
+		}
+	}
+}
+
+// annotatedDiagnostic is a diagnostic carrying its baseline classification in
+// JSON/YAML output.
+type annotatedDiagnostic struct {
+	message        diag.Message
+	baselineStatus string
+}
+
+func (a annotatedDiagnostic) MarshalJSON() ([]byte, error) {
+	unstructured := a.message.Unstructured(true)
+	unstructured["baselineStatus"] = a.baselineStatus
+	return json.Marshal(unstructured)
+}
+
+type baselineMachineOutput struct {
+	Messages       []annotatedDiagnostic `json:"messages" yaml:"messages"`
+	BaselineReport baselineSummaryOutput `json:"baselineReport" yaml:"baselineReport"`
+}
+
+type baselineSummaryOutput struct {
+	New         int              `json:"new" yaml:"new"`
+	Known       []baseline.Entry `json:"known" yaml:"known"`
+	Disappeared []baseline.Entry `json:"disappeared" yaml:"disappeared"`
+	Expired     []baseline.Entry `json:"expired" yaml:"expired"`
+}
+
+func marshalBaselineMachineOutput(report *baseline.Report, newMessages, knownMessages diag.Messages, format string) (string, error) {
+	out := baselineMachineOutput{
+		BaselineReport: baselineSummaryOutput{
+			New:         len(report.New),
+			Known:       entriesForMessages(report.Known),
+			Disappeared: report.Disappeared,
+			Expired:     report.Expired,
+		},
+		Messages: make([]annotatedDiagnostic, 0, len(newMessages)+len(knownMessages)),
+	}
+	if out.BaselineReport.Disappeared == nil {
+		out.BaselineReport.Disappeared = []baseline.Entry{}
+	}
+	if out.BaselineReport.Expired == nil {
+		out.BaselineReport.Expired = []baseline.Entry{}
+	}
+	for _, m := range newMessages {
+		out.Messages = append(out.Messages, annotatedDiagnostic{message: m, baselineStatus: "new"})
+	}
+	for _, m := range knownMessages {
+		out.Messages = append(out.Messages, annotatedDiagnostic{message: m, baselineStatus: "known"})
+	}
+	if format == formatting.JSONFormat {
+		buf, err := json.MarshalIndent(out, "", "\t")
+		return string(buf), err
+	}
+	buf, err := yaml.Marshal(out)
+	return string(buf), err
+}
+
+func entriesForMessages(messages diag.Messages) []baseline.Entry {
+	if len(messages) == 0 {
+		return []baseline.Entry{}
+	}
+	entries := make([]baseline.Entry, 0, len(messages))
+	for _, m := range messages {
+		if e, ok := baseline.EntryFromMessage(m); ok {
+			entries = append(entries, e)
+		}
+	}
+	return entries
 }
 
 func isValidFile(f string) bool {

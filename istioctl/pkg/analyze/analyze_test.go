@@ -15,6 +15,7 @@
 package analyze
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/yaml"
 
 	"istio.io/istio/istioctl/pkg/cli"
 	"istio.io/istio/istioctl/pkg/util/testutil"
@@ -264,5 +266,312 @@ func TestRunSpecificAnalyzer(t *testing.T) {
 			analyze := Analyze(ctx)
 			testutil.VerifyOutput(t, analyze, tc.TestCase)
 		})
+	}
+}
+
+// brokenGatewaysYaml is a file-only analysis input that reports two IST0106
+// schema validation errors on named Gateway resources (alpha and beta).
+const brokenGatewaysYaml = `apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: beta
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - hosts:
+        - "foo.bar"
+---
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: alpha
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - hosts:
+        - "bar.bar"
+`
+
+// partiallyFixedGatewaysYaml fixes alpha but introduces a new broken gateway
+// (gamma): relative to a baseline of brokenGatewaysYaml this yields one new,
+// one known and one disappeared diagnostic.
+const partiallyFixedGatewaysYaml = `apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: beta
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - hosts:
+        - "foo.bar"
+---
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: alpha
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - port:
+        number: 80
+        name: http
+        protocol: HTTP
+      hosts:
+        - "bar.bar"
+---
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: gamma
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - hosts:
+        - "gamma.baz"
+`
+
+func runAnalyze(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	cmd := Analyze(cli.NewFakeContext(nil))
+	cmd.SetArgs(args)
+	cmd.SilenceUsage = true
+	var out strings.Builder
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	err := cmd.Execute()
+	return out.String(), err
+}
+
+// tempDir creates a best-effort temporary directory. The file analyzer keeps
+// input files open until a finalizer runs, so removal can fail on Windows;
+// cleanup errors are therefore intentionally ignored.
+func tempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "istioctl-analyze-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+func exportBaselineFor(t *testing.T, inputFile string) string {
+	t.Helper()
+	baselinePath := filepath.Join(tempDir(t), "baseline.yaml")
+	out, err := runAnalyze(t, "--use-kube=false", "--failure-threshold", "ERROR",
+		"--baseline-export", baselinePath, inputFile)
+	if err != nil {
+		t.Fatalf("baseline export failed: %v\noutput: %s", err, out)
+	}
+	data, err := os.ReadFile(baselinePath)
+	if err != nil {
+		t.Fatalf("baseline file was not written: %v", err)
+	}
+	if !strings.Contains(string(data), "version: v1alpha1") {
+		t.Fatalf("exported baseline missing version:\n%s", string(data))
+	}
+	return baselinePath
+}
+
+func writeTempYAML(t *testing.T, name, content string) string {
+	t.Helper()
+	path := filepath.Join(tempDir(t), name)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestBaselineExportAndAccept(t *testing.T) {
+	input := writeTempYAML(t, "gateways.yaml", brokenGatewaysYaml)
+	baselinePath := exportBaselineFor(t, input)
+
+	// Without a baseline the same diagnostics fail the command.
+	out, err := runAnalyze(t, "--use-kube=false", "--failure-threshold", "ERROR", input)
+	if err == nil {
+		t.Fatalf("expected analysis without baseline to fail, got output: %s", out)
+	}
+
+	// With the exported baseline the identical diagnostics are accepted.
+	out, err = runAnalyze(t, "--use-kube=false", "--failure-threshold", "ERROR",
+		"--baseline", baselinePath, input)
+	if err != nil {
+		t.Fatalf("expected baseline to accept identical diagnostics, got err: %v\noutput: %s", err, out)
+	}
+	if !strings.Contains(out, "Known diagnostics") || !strings.Contains(out, "0 new, 2 known") {
+		t.Fatalf("expected known diagnostics and summary, got: %s", out)
+	}
+}
+
+func TestBaselineIgnoresLineNumbersAndOrder(t *testing.T) {
+	input := writeTempYAML(t, "gateways.yaml", brokenGatewaysYaml)
+	baselinePath := exportBaselineFor(t, input)
+
+	// Shift every diagnostic to a different line number: matching must be unaffected.
+	shifted := writeTempYAML(t, "shifted.yaml", "\n\n# padding line\n"+brokenGatewaysYaml)
+	out, err := runAnalyze(t, "--use-kube=false", "--failure-threshold", "ERROR",
+		"--baseline", baselinePath, shifted)
+	if err != nil {
+		t.Fatalf("expected line number shifts not to break baseline matching: %v\noutput: %s", err, out)
+	}
+	if !strings.Contains(out, "0 new, 2 known, 0 disappeared, 0 expired") {
+		t.Fatalf("expected all diagnostics to remain known, got: %s", out)
+	}
+}
+
+func TestBaselineNewIssueFailsAndFixedIssueDisappears(t *testing.T) {
+	input := writeTempYAML(t, "gateways.yaml", brokenGatewaysYaml)
+	baselinePath := exportBaselineFor(t, input)
+	changed := writeTempYAML(t, "changed.yaml", partiallyFixedGatewaysYaml)
+
+	out, err := runAnalyze(t, "--use-kube=false", "--failure-threshold", "ERROR",
+		"--baseline", baselinePath, changed)
+	if err == nil {
+		t.Fatalf("expected the new diagnostic to fail the command, output: %s", out)
+	}
+	for _, want := range []string{
+		"1 new, 1 known, 1 disappeared, 0 expired",
+		"Gateway default/gamma",
+		"Disappeared baseline entries",
+		"Gateway default/alpha",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected output to contain %q, got: %s", want, out)
+		}
+	}
+}
+
+func TestBaselineExpiredEntryResurfaces(t *testing.T) {
+	input := writeTempYAML(t, "gateways.yaml", brokenGatewaysYaml)
+	baselinePath := exportBaselineFor(t, input)
+
+	// Mark the first exported entry as expired in 2020; leave the other one valid.
+	raw, err := os.ReadFile(baselinePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := map[string]any{}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	entries := doc["entries"].([]any)
+	first := entries[0].(map[string]any)
+	first["expiresAt"] = "2020-01-01T00:00:00Z"
+	rewritten, err := yaml.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(baselinePath, rewritten, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runAnalyze(t, "--use-kube=false", "--failure-threshold", "ERROR",
+		"--baseline", baselinePath, input)
+	if err == nil {
+		t.Fatalf("expected expired diagnostic to fail the command again, output: %s", out)
+	}
+	if !strings.Contains(out, "1 new, 1 known, 0 disappeared, 1 expired") {
+		t.Fatalf("expected one expired entry, got: %s", out)
+	}
+	if !strings.Contains(out, "Expired baseline entries") {
+		t.Fatalf("expected expired entries to be summarized, got: %s", out)
+	}
+}
+
+func TestBaselineMalformedFileFailsClearly(t *testing.T) {
+	input := writeTempYAML(t, "gateways.yaml", brokenGatewaysYaml)
+
+	cases := map[string]string{
+		"missing file":     filepath.Join(t.TempDir(), "does-not-exist.yaml"),
+		"syntax error":     writeTempYAML(t, "bad-syntax.yaml", "version: v1alpha1\nentries: [\n"),
+		"bad version":      writeTempYAML(t, "bad-version.yaml", "version: v9\nentries: []\n"),
+		"missing level":    writeTempYAML(t, "bad-level.yaml", "version: v1alpha1\nentries:\n- code: IST0106\n  resource: Gateway default/alpha\n"),
+		"missing resource": writeTempYAML(t, "bad-resource.yaml", "version: v1alpha1\nentries:\n- code: IST0106\n  level: Error\n"),
+		"invalid expiry":   writeTempYAML(t, "bad-expiry.yaml", "version: v1alpha1\nentries:\n- code: IST0106\n  level: Error\n  resource: Gateway default/alpha\n  expiresAt: tomorrow\n"),
+	}
+	for name, path := range cases {
+		t.Run(name, func(t *testing.T) {
+			out, err := runAnalyze(t, "--use-kube=false", "--baseline", path, input)
+			if err == nil {
+				t.Fatalf("expected %s baseline to fail, output: %s", name, out)
+			}
+			if !strings.Contains(err.Error(), "baseline") {
+				t.Fatalf("expected a clear baseline error for %s, got: %v", name, err)
+			}
+		})
+	}
+}
+
+func TestBaselineFlagsAreMutuallyExclusive(t *testing.T) {
+	input := writeTempYAML(t, "gateways.yaml", brokenGatewaysYaml)
+	baselinePath := filepath.Join(t.TempDir(), "baseline.yaml")
+	_, err := runAnalyze(t, "--use-kube=false",
+		"--baseline", baselinePath, "--baseline-export", baselinePath+".new", input)
+	if err == nil || !strings.Contains(err.Error(), "cannot be used at the same time") {
+		t.Fatalf("expected a mutually-exclusive flags error, got: %v", err)
+	}
+}
+
+func TestBaselineJSONOutput(t *testing.T) {
+	input := writeTempYAML(t, "gateways.yaml", brokenGatewaysYaml)
+	baselinePath := exportBaselineFor(t, input)
+
+	out, err := runAnalyze(t, "--use-kube=false", "-o", "json", "--baseline", baselinePath, input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v\noutput: %s", err, out)
+	}
+	// stdout (the JSON document) and stderr (the baseline summary) share one
+	// buffer, so extract the JSON object before decoding.
+	start, end := strings.Index(out, "{"), strings.LastIndex(out, "}")
+	if start < 0 || end < start {
+		t.Fatalf("no JSON document found in output: %s", out)
+	}
+	var parsed struct {
+		Messages []struct {
+			Code           string `json:"code"`
+			BaselineStatus string `json:"baselineStatus"`
+		} `json:"messages"`
+		BaselineReport struct {
+			New         int `json:"new"`
+			Known       []map[string]any
+			Disappeared []map[string]any
+			Expired     []map[string]any
+		} `json:"baselineReport"`
+	}
+	if err := json.Unmarshal([]byte(out[start:end+1]), &parsed); err != nil {
+		t.Fatalf("invalid JSON output: %v\n%s", err, out)
+	}
+	if len(parsed.Messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(parsed.Messages))
+	}
+	for _, m := range parsed.Messages {
+		if m.BaselineStatus != "known" || m.Code != "IST0106" {
+			t.Fatalf("expected known IST0106 message, got %+v", m)
+		}
+	}
+	if parsed.BaselineReport.New != 0 || len(parsed.BaselineReport.Known) != 2 ||
+		len(parsed.BaselineReport.Disappeared) != 0 || len(parsed.BaselineReport.Expired) != 0 {
+		t.Fatalf("unexpected baseline report: %+v", parsed.BaselineReport)
+	}
+}
+
+func TestBaselineKeepsSuppressWorking(t *testing.T) {
+	input := writeTempYAML(t, "gateways.yaml", brokenGatewaysYaml)
+	baselinePath := exportBaselineFor(t, input)
+
+	// Suppressing beta removes it from the diagnostics, so it shows up as
+	// disappeared while alpha stays known; the command still succeeds.
+	out, err := runAnalyze(t, "--use-kube=false", "--failure-threshold", "ERROR",
+		"--baseline", baselinePath, "-S", "IST0106=Gateway default/beta", input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v\noutput: %s", err, out)
+	}
+	if !strings.Contains(out, "0 new, 1 known, 1 disappeared, 0 expired") {
+		t.Fatalf("expected suppress and baseline to compose, got: %s", out)
 	}
 }
