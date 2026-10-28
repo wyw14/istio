@@ -156,6 +156,7 @@ func AuthZ(ctx cli.Context) *cobra.Command {
 	}
 
 	cmd.AddCommand(checkCmd(ctx))
+	cmd.AddCommand(graphCommand(ctx))
 	cmd.Long += "\n\n" + util.ExperimentalMsg
 	return cmd
 }

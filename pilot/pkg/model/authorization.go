@@ -19,6 +19,7 @@ import (
 
 	authpb "istio.io/api/security/v1beta1"
 	"istio.io/istio/pilot/pkg/features"
+	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/sets"
@@ -90,31 +91,41 @@ type AuthorizationPolicies struct {
 
 // GetAuthorizationPolicies returns the AuthorizationPolicies for the given environment.
 func GetAuthorizationPolicies(env *Environment) *AuthorizationPolicies {
+	return NewAuthorizationPolicies(env.Mesh().GetRootNamespace(), env.List(gvk.AuthorizationPolicy, NamespaceAll))
+}
+
+// NewAuthorizationPolicies organizes the given AuthorizationPolicy configs by namespace and
+// builds the targetRef indexes. Policies are ordered by creation time, exactly as during a
+// configuration push.
+//
+// This performs no authorization computation itself; it is shared by the serving path
+// (GetAuthorizationPolicies) and read-only tooling (e.g. the istioctl dependency graph
+// exporter) so that both observe the identical policy ordering and indexing.
+func NewAuthorizationPolicies(rootNamespace string, policies []config.Config) *AuthorizationPolicies {
 	policy := &AuthorizationPolicies{
 		NamespaceToPolicies: map[string][]AuthorizationPolicy{},
 		httpRoutePolicies:   map[types.NamespacedName]AuthorizationPoliciesResult{},
-		RootNamespace:       env.Mesh().GetRootNamespace(),
+		RootNamespace:       rootNamespace,
 	}
 
-	policies := env.List(gvk.AuthorizationPolicy, NamespaceAll)
 	sortConfigByCreationTime(policies)
 
 	policyCount := make(map[string]int)
-	for _, config := range policies {
-		policyCount[config.Namespace]++
+	for _, cfg := range policies {
+		policyCount[cfg.Namespace]++
 	}
 
-	for _, config := range policies {
+	for _, cfg := range policies {
 		authzConfig := AuthorizationPolicy{
-			Name:        config.Name,
-			Namespace:   config.Namespace,
-			Annotations: config.Annotations,
-			Spec:        config.Spec.(*authpb.AuthorizationPolicy),
+			Name:        cfg.Name,
+			Namespace:   cfg.Namespace,
+			Annotations: cfg.Annotations,
+			Spec:        cfg.Spec.(*authpb.AuthorizationPolicy),
 		}
-		if _, ok := policy.NamespaceToPolicies[config.Namespace]; !ok {
-			policy.NamespaceToPolicies[config.Namespace] = make([]AuthorizationPolicy, 0, policyCount[config.Namespace])
+		if _, ok := policy.NamespaceToPolicies[cfg.Namespace]; !ok {
+			policy.NamespaceToPolicies[cfg.Namespace] = make([]AuthorizationPolicy, 0, policyCount[cfg.Namespace])
 		}
-		policy.NamespaceToPolicies[config.Namespace] = append(policy.NamespaceToPolicies[config.Namespace], authzConfig)
+		policy.NamespaceToPolicies[cfg.Namespace] = append(policy.NamespaceToPolicies[cfg.Namespace], authzConfig)
 		policy.indexHTTPRoutePolicies(authzConfig)
 	}
 

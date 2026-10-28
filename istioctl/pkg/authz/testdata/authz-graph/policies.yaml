@@ -1,0 +1,85 @@
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: root-allow
+  namespace: istio-system
+spec:
+  action: ALLOW
+  selector:
+    matchLabels:
+      app: httpbin
+  rules:
+  - to:
+    - operation:
+        methods: ["GET"]
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: ns-deny
+  namespace: foo
+spec:
+  action: DENY
+  rules:
+  - {}
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: pinned-v2
+  namespace: foo
+  labels:
+    istio.io/rev: v2
+spec:
+  action: ALLOW
+  selector:
+    matchLabels:
+      app: revsvc
+  rules:
+  - to:
+    - operation:
+        ports: ["8080"]
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: wp-svc
+  namespace: foo
+spec:
+  action: ALLOW
+  targetRef:
+    group: ""
+    kind: Service
+    name: foo-svc
+  rules:
+  - to:
+    - operation:
+        methods: ["GET"]
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: xns-gateway
+  namespace: foo
+spec:
+  action: ALLOW
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: gw
+    namespace: bar
+  rules:
+  - {}
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: typo-policy
+  namespace: foo
+spec:
+  acshion: DENY
+  rules:
+  - to:
+    - operation:
+        methods: ["GET"]
+        mothods: ["POST"]
